@@ -1,0 +1,50 @@
+﻿# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pyd
+*.pyd
+
+# Package/build
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+*.egg
+*.manifest
+*.spec
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Data / runtime output
+data/index/
+data/logs/
+
+# Caches
+.cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db

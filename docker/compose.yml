@@ -1,0 +1,87 @@
+services:
+  # ── Ollama LLM server ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: veritas-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # GPU: uncomment to enable NVIDIA GPU passthrough
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Model pull (runs once, then exits) ────────────────────────────────────
+  # Ensures the configured model is available before the API starts.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: veritas-model-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-gemma3}"]
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: "no"
+
+  # ── Veritas API ────────────────────────────────────────────────────────────
+  veritas:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: veritas-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      # LLM
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3}
+      # Embedding
+      - EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+      # Pipeline
+      - NLI_CONFIDENCE_THRESHOLD=0.65
+      - MAX_CORRECTION_ITERATIONS=3
+      - IMPROVEMENT_THRESHOLD=0.05
+      # Logging
+      - LOG_DIR=/app/data/logs
+    volumes:
+      # FAISS index (build offline, mount here)
+      - ./data/index:/app/data/index:ro
+      # Experiment logs (writable)
+      - veritas-logs:/app/data/logs
+      # HuggingFace model cache (avoids re-downloading on restart)
+      - hf-cache:/app/.cache/huggingface
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+
+volumes:
+  ollama-models:
+    driver: local
+  veritas-logs:
+    driver: local
+  hf-cache:
+    driver: local
