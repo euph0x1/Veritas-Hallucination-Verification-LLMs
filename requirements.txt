@@ -1,0 +1,25 @@
+# ── Core framework ────────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# ── LLM + embedding ───────────────────────────────────────────────────────────
+httpx==0.28.1                     # async HTTP for Ollama provider
+sentence-transformers==3.3.1      # SentenceTransformerProvider
+transformers==4.47.0              # DeBERTa NLI model
+torch==2.6.0                      # NLI inference backend
+
+# ── Vector search ─────────────────────────────────────────────────────────────
+faiss-cpu==1.14.3                  # FAISS index (swap for faiss-gpu if GPU available)
+
+# ── Corpus / data ─────────────────────────────────────────────────────────────
+datasets==3.2.0                   # HuggingFace Wikipedia dataset loader
+tqdm==4.67.1                      # progress bars during indexing
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.25.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+numpy==2.2.0
