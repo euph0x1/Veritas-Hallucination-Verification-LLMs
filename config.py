@@ -37,8 +37,12 @@ class Settings(BaseSettings):
     )
     retrieval_top_k: int = Field(5, description="Number of evidence chunks to retrieve per claim")
     retrieval_min_similarity: float = Field(
-        0.3,
-        description="Minimum cosine similarity to include a chunk as evidence"
+        0.55,
+        description=(
+            "Minimum cosine similarity to include a chunk as evidence. "
+            "0.55 filters out loosely-related corpus chunks that would produce "
+            "misleading NLI labels. Lower only if corpus coverage is poor."
+        )
     )
 
     # ── NLI verifier ─────────────────────────────────────────────────────────
@@ -53,7 +57,7 @@ class Settings(BaseSettings):
     nli_batch_size: int = Field(8, description="Pairs per NLI forward pass")
 
     # ── Corpus ────────────────────────────────────────────────────────────────
-    corpus_chunk_size: int = Field(200, description="Chunk size in tokens")
+    corpus_chunk_size: int = Field(100, description="Chunk size in words — smaller = more precise NLI evidence")
     corpus_chunk_overlap: int = Field(50, description="Overlap between consecutive chunks")
     corpus_max_articles: int = Field(500, description="Wikipedia articles to index in V1")
 
