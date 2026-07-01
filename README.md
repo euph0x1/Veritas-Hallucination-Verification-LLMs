@@ -77,7 +77,7 @@ Pull the Ollama model and build the FAISS index once before running the API:
 
 ```bash
 ollama pull gemma3
-python -m corpus.build_index --max-articles 100
+python -m corpus.build_index --max-articles 500
 ```
 
 ## Quick Start
