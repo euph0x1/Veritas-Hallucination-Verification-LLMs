@@ -5,22 +5,16 @@ For each (claim, evidence) pair, runs Natural Language Inference to
 determine whether the evidence supports, contradicts, or is neutral
 towards the claim.
 
-Key V1 decision:
-    If the model's max confidence is below nli_confidence_threshold,
-    the label is overridden to "uncertain" rather than forcing a
-    low-confidence entailment/contradiction.
-
-Model:
-    cross-encoder/nli-deberta-v3-small
-    — Purpose-built NLI cross-encoder
-    — Takes (premise, hypothesis) pairs
-    — Outputs logits for [contradiction, entailment, neutral]
-    — Faster than full DeBERTa-v3-large, sufficient for V1
+Key V1 decisions:
+    - Confidence threshold: below nli_confidence_threshold → "uncertain"
+    - Evidence aggregation: run NLI against all top-k chunks, not just top-1
+    - Aggregation priority: strong contradiction (>=0.80) > strong entailment
+      (>=0.80) > highest confidence overall
+    - Similarity floor: chunks below 0.50 cosine similarity are skipped
 """
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -36,11 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 class NLILabel(str, Enum):
-    ENTAILMENT = "entailment"       # evidence supports the claim
-    NEUTRAL = "neutral"             # evidence neither supports nor contradicts
-    CONTRADICTION = "contradiction" # evidence contradicts the claim
-    UNCERTAIN = "uncertain"         # max confidence below threshold
-    NO_EVIDENCE = "no_evidence"     # no evidence chunks were retrieved
+    ENTAILMENT = "entailment"
+    NEUTRAL = "neutral"
+    CONTRADICTION = "contradiction"
+    UNCERTAIN = "uncertain"
+    NO_EVIDENCE = "no_evidence"
 
 
 @dataclass
@@ -48,20 +42,19 @@ class ClaimVerification:
     """NLI result for a single claim."""
     claim: str
     label: NLILabel
-    confidence: float               # probability of the winning label [0, 1]
+    confidence: float
     entailment_score: float
     neutral_score: float
     contradiction_score: float
-    evidence_used: str | None       # text of the best-scoring evidence chunk
-    evidence_title: str | None      # source title for logging
-    evidence_similarity: float      # retrieval cosine similarity
+    evidence_used: str | None
+    evidence_title: str | None
+    evidence_similarity: float
 
 
 @dataclass
 class VerifierResult:
     verifications: list[ClaimVerification]
 
-    # Convenience counts
     @property
     def total(self) -> int:
         return len(self.verifications)
@@ -88,7 +81,6 @@ class VerifierResult:
 
     @property
     def unsupported(self) -> list[ClaimVerification]:
-        """Claims that need correction: contradicted + neutral + uncertain."""
         return [
             v for v in self.verifications
             if v.label in (NLILabel.CONTRADICTION, NLILabel.NEUTRAL, NLILabel.UNCERTAIN)
@@ -99,14 +91,9 @@ class NLIVerifier:
     """
     Runs DeBERTa-v3 NLI on (claim, evidence) pairs.
 
-    The model is loaded lazily on first call. For V1 this is fine
-    since FastAPI startup triggers the first warm-up call.
-
-    Evidence aggregation strategy (V1):
-        Run NLI against the top-1 evidence chunk only.
-        If we have multiple chunks, pick the one with highest
-        retrieval similarity as the "best evidence."
-        V2 extension: aggregate NLI across all top-k chunks.
+    Evidence aggregation: runs NLI against all top-k chunks above the
+    similarity floor, then picks the most meaningful result using a
+    confidence-weighted priority system.
     """
 
     def __init__(
@@ -124,7 +111,6 @@ class NLIVerifier:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _load(self):
-        """Lazy-load model and tokenizer."""
         if self._model is not None:
             return
         logger.info("Loading NLI model: %s on %s", self._model_name, self._device)
@@ -132,24 +118,11 @@ class NLIVerifier:
         self._model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
         self._model.to(self._device)
         self._model.eval()
-
-        # Map model label indices to NLI label names
-        # DeBERTa-v3 NLI label order: {0: contradiction, 1: entailment, 2: neutral}
-        # Always read from model config to handle variations
         id2label = self._model.config.id2label
         self._label_map = {idx: label.lower() for idx, label in id2label.items()}
         logger.info("NLI model loaded. Label map: %s", self._label_map)
 
     async def verify(self, claim_evidences: list[ClaimEvidence]) -> VerifierResult:
-        """
-        Verify all claims against their retrieved evidence.
-
-        Args:
-            claim_evidences: Output from the EvidenceRetriever.
-
-        Returns:
-            VerifierResult with one ClaimVerification per claim.
-        """
         loop = asyncio.get_event_loop()
         verifications = await loop.run_in_executor(
             None, self._verify_sync, claim_evidences
@@ -157,9 +130,7 @@ class NLIVerifier:
         return VerifierResult(verifications=verifications)
 
     def _verify_sync(self, claim_evidences: list[ClaimEvidence]) -> list[ClaimVerification]:
-        """Synchronous NLI inference — runs in thread pool."""
         self._load()
-
         results: list[ClaimVerification] = []
 
         for ce in claim_evidences:
@@ -177,24 +148,48 @@ class NLIVerifier:
                 ))
                 continue
 
-            # Use the highest-similarity evidence chunk as premise
-            best_evidence = ce.evidence[0]
-            premise = best_evidence.text
-            hypothesis = ce.claim
+            # Filter to chunks above similarity floor
+            SIMILARITY_FLOOR = 0.50
+            valid_evidence = [e for e in ce.evidence if e.similarity >= SIMILARITY_FLOOR]
 
-            scores = self._run_nli(premise, hypothesis)
-            label, confidence = self._decide_label(scores)
+            if not valid_evidence:
+                results.append(ClaimVerification(
+                    claim=ce.claim,
+                    label=NLILabel.NO_EVIDENCE,
+                    confidence=0.0,
+                    entailment_score=0.0,
+                    neutral_score=0.0,
+                    contradiction_score=0.0,
+                    evidence_used=None,
+                    evidence_title=None,
+                    evidence_similarity=ce.evidence[0].similarity if ce.evidence else 0.0,
+                ))
+                logger.debug(
+                    "Claim skipped — no evidence above similarity floor %.2f: %.60s",
+                    SIMILARITY_FLOOR, ce.claim,
+                )
+                continue
+
+            # Run NLI against every valid chunk
+            chunk_results = []
+            for ev_chunk in valid_evidence:
+                chunk_scores = self._run_nli(ev_chunk.text, ce.claim)
+                chunk_results.append((chunk_scores, ev_chunk))
+
+            # Aggregate across chunks
+            best_scores, best_chunk = self._aggregate_nli_results(chunk_results)
+            label, confidence = self._decide_label(best_scores)
 
             results.append(ClaimVerification(
                 claim=ce.claim,
                 label=label,
                 confidence=confidence,
-                entailment_score=scores.get("entailment", 0.0),
-                neutral_score=scores.get("neutral", 0.0),
-                contradiction_score=scores.get("contradiction", 0.0),
-                evidence_used=premise,
-                evidence_title=best_evidence.title,
-                evidence_similarity=best_evidence.similarity,
+                entailment_score=best_scores.get("entailment", 0.0),
+                neutral_score=best_scores.get("neutral", 0.0),
+                contradiction_score=best_scores.get("contradiction", 0.0),
+                evidence_used=best_chunk.text,
+                evidence_title=best_chunk.title,
+                evidence_similarity=best_chunk.similarity,
             ))
 
         logger.info(
@@ -208,12 +203,59 @@ class NLIVerifier:
         )
         return results
 
-    def _run_nli(self, premise: str, hypothesis: str) -> dict[str, float]:
+    def _aggregate_nli_results(
+        self,
+        chunk_results: list[tuple[dict, object]],
+    ) -> tuple[dict, object]:
         """
-        Run one (premise, hypothesis) pair through the NLI model.
+        Select the most meaningful NLI result from multiple (scores, chunk) pairs.
 
-        Returns a dict mapping label name → softmax probability.
+        Logic:
+        - Strong contradiction (>= 0.80) wins first.
+        - Strong entailment (>= 0.80) wins second.
+        - Otherwise return highest confidence overall (likely neutral).
+
+        This prevents weak contradictions from loosely-related chunks
+        overriding strong entailments from highly relevant chunks.
         """
+        STRONG_THRESHOLD = 0.80
+
+        best_overall_scores, best_overall_chunk, best_overall_conf = None, None, -1.0
+        best_contra_scores, best_contra_chunk, best_contra_conf = None, None, -1.0
+        best_entail_scores, best_entail_chunk, best_entail_conf = None, None, -1.0
+
+        for scores, chunk in chunk_results:
+            if not scores:
+                continue
+            top_label = max(scores, key=scores.__getitem__)
+            top_conf = scores[top_label]
+
+            if top_conf > best_overall_conf:
+                best_overall_conf = top_conf
+                best_overall_scores = scores
+                best_overall_chunk = chunk
+
+            if top_label == "contradiction" and top_conf > best_contra_conf:
+                best_contra_conf = top_conf
+                best_contra_scores = scores
+                best_contra_chunk = chunk
+
+            if top_label == "entailment" and top_conf > best_entail_conf:
+                best_entail_conf = top_conf
+                best_entail_scores = scores
+                best_entail_chunk = chunk
+
+        if best_contra_conf >= STRONG_THRESHOLD:
+            return best_contra_scores, best_contra_chunk
+
+        if best_entail_conf >= STRONG_THRESHOLD:
+            return best_entail_scores, best_entail_chunk
+
+        if best_overall_scores is None:
+            best_overall_scores, best_overall_chunk = chunk_results[0]
+        return best_overall_scores, best_overall_chunk
+
+    def _run_nli(self, premise: str, hypothesis: str) -> dict[str, float]:
         inputs = self._tokenizer(
             premise,
             hypothesis,
@@ -227,16 +269,11 @@ class NLIVerifier:
             logits = self._model(**inputs).logits
 
         probs = F.softmax(logits, dim=-1).squeeze().cpu().tolist()
-
-        # Map index → label name → probability
         return {self._label_map[i]: float(p) for i, p in enumerate(probs)}
 
     def _decide_label(self, scores: dict[str, float]) -> tuple[NLILabel, float]:
         """
-        Choose the final NLI label with confidence threshold.
-
-        If the winning label's probability is below nli_confidence_threshold,
-        return UNCERTAIN instead of forcing a low-confidence label.
+        Apply confidence threshold. Below threshold → UNCERTAIN.
         """
         if not scores:
             return NLILabel.UNCERTAIN, 0.0
@@ -252,5 +289,4 @@ class NLIVerifier:
             "neutral": NLILabel.NEUTRAL,
             "contradiction": NLILabel.CONTRADICTION,
         }
-        label = label_map.get(best_label_str, NLILabel.UNCERTAIN)
-        return label, best_score
+        return label_map.get(best_label_str, NLILabel.UNCERTAIN), best_score
