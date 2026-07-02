@@ -22,27 +22,40 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-_SYSTEM_PROMPT = """You are a precise editor correcting factual errors in a response.
-You will be given:
-1. The original response
-2. A list of specific correction instructions for claims that are unsupported or contradicted
+_SYSTEM_PROMPT = """You are an editor applying factual corrections to a piece of text.
 
-Your task:
-- Apply ONLY the specified corrections
-- Do not rewrite sections that are not flagged
-- Do not add new information beyond what the corrections require
-- Preserve the original tone, structure, and all supported claims exactly
-- Output the corrected response only, with no explanation or preamble"""
+You will receive:
+- ORIGINAL TEXT: the text that needs correcting
+- CORRECTIONS: a numbered list of specific factual errors to fix
 
-_CORRECTION_TEMPLATE = """Original response:
-\"\"\"
+YOUR TASK:
+1. Read every correction instruction carefully.
+2. Find the exact phrase or sentence in the original text that the instruction refers to.
+3. Apply the fix described — change only the specific word, date, name, or phrase that is wrong.
+4. Leave every other part of the text completely unchanged.
+5. Output the corrected text only — no explanation, no commentary, no preamble.
+
+CRITICAL RULES:
+- Do NOT copy correction instructions verbatim into the text.
+- Do NOT replace whole sentences with unrelated content from an instruction.
+- If an instruction says "change X to Y", find X in the text and replace it with Y only.
+- If an instruction says "remove this claim", delete that sentence from the text.
+- If an instruction is confusing or not applicable, skip it and leave the text unchanged.
+
+EXAMPLE:
+Original text: "Newton invented the telephone in 1865."
+Correction: "Change 'Newton' to 'Bell' — the telephone was invented by Alexander Graham Bell."
+Corrected text: "Bell invented the telephone in 1865."
+
+Do not output anything except the corrected text."""
+
+_CORRECTION_TEMPLATE = """ORIGINAL TEXT:
 {original_response}
-\"\"\"
 
-Correction instructions:
+CORRECTIONS TO APPLY:
 {correction_block}
 
-Write the corrected response:"""
+Output the corrected text now:"""
 
 
 @dataclass
@@ -167,10 +180,15 @@ class SelfCorrectionEngine:
             )
 
             # ── Circuit breaker: score regressed significantly ─────────────────
-            if new_score > current_report.hallucination_score + 0.1:
+            # Tolerance of 0.2 allows minor score fluctuations from re-extraction
+            # while still catching cases where correction made things much worse.
+            # The best_response is always returned regardless, so this just
+            # determines whether to attempt another iteration.
+            if new_score > current_report.hallucination_score + 0.2:
                 logger.warning(
-                    "Score regressed (%.3f → %.3f). Stopping early.",
-                    current_report.hallucination_score, new_score,
+                    "Score regressed significantly (%.3f → %.3f). "
+                    "Returning best-seen response. Corrected text was: %.200s",
+                    current_report.hallucination_score, new_score, corrected_text,
                 )
                 stop_reason = "circuit_breaker"
                 break
