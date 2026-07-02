@@ -1,14 +1,27 @@
 """
 core/pipeline/critic.py  —  Step 6: Targeted critique generation.
 
-Produces claim-level, actionable critique for each unsupported claim.
-The critique is grounded in the retrieved evidence so the self-correction
-engine has concrete information to work with, not just a "this is wrong."
+V1 approach: rule-based critique generation.
 
-Design:
-    - One critique prompt per unsupported claim (not one giant prompt)
-    - Each critique includes: what's wrong, what evidence says, what to fix
-    - Critiques are assembled into a single structured block passed to the corrector
+Instead of relying on the LLM to interpret evidence (which causes hallucinated
+correction instructions when evidence chunks are low-quality), this version uses
+a structured rule-based system:
+
+1. For CONTRADICTION with high-similarity evidence (>= 0.75):
+   Call the LLM with strict rules and evidence relevance check.
+
+2. For CONTRADICTION with low-similarity evidence (< 0.75):
+   Use a safe generic instruction — the evidence is probably about a
+   different aspect of the topic, not the specific claim.
+
+3. For NEUTRAL / UNCERTAIN:
+   Always use generic instruction — no strong evidence either way.
+
+4. For NO_EVIDENCE:
+   Template-only, no LLM call.
+
+This eliminates the "LL.D. from Edinburgh → remove birthplace claim" bug
+by never trusting low-similarity evidence for generating specific corrections.
 """
 
 import logging
@@ -20,100 +33,81 @@ from core.providers.base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
+# Only call LLM for high-similarity evidence
+HIGH_SIMILARITY_THRESHOLD = 0.75
 
-_SYSTEM_PROMPT = """You are a precise fact-checker generating correction instructions.
-Given an unsupported or contradicted factual claim and relevant evidence, produce a
-single, specific instruction telling the writer exactly what to fix and why.
+_SYSTEM_PROMPT = """You are a fact-checker writing one correction instruction.
 
-Your instruction must:
-- Be one to three sentences maximum
-- Reference the specific conflicting detail (date, name, number, etc.)
-- State what the evidence actually says
-- Tell the writer exactly what to change
+You will receive a CLAIM and EVIDENCE that directly contradicts it.
 
-Do not rewrite the text yourself. Do not explain NLI or verification. Output only the instruction."""
+Your task: write ONE sentence identifying the specific factual error and what 
+the correct value is, based only on what the evidence explicitly states.
 
-_CRITIQUE_TEMPLATE = """Claim: "{claim}"
+STRICT RULES:
+- Output the instruction sentence only. Nothing else.
+- Only reference facts explicitly stated in the evidence text.
+- Never say "remove this claim" unless the evidence explicitly states the 
+  claim's subject never did or never was the thing claimed.
+- Never fabricate a correction value not present in the evidence.
+- If you cannot identify the specific error from the evidence, output:
+  "This claim could not be reliably verified — consider qualifying it with 'reportedly'."
 
-Verification result: {label} (confidence: {confidence:.0%})
+EXAMPLES:
+Claim: "Bell invented the television."
+Evidence: "Bell did not develop television technology. Television was invented by Philo Farnsworth."
+Instruction: "Remove this claim — Bell did not invent television; it was invented by Philo Farnsworth."
 
-Best matching evidence from corpus:
-Source: {source}
-Text: "{evidence}"
+Claim: "Einstein was born in 1900."
+Evidence: "Albert Einstein was born on March 14, 1879, in Ulm, Germany."
+Instruction: "Change the birth year from 1900 to 1879, as Einstein was born on March 14, 1879."
 
-Write a specific correction instruction for this claim."""
+Claim: "Paris is the capital of Germany."
+Evidence: "Berlin is the capital and largest city of Germany."
+Instruction: "Change 'Germany' to 'France' — Berlin is the capital of Germany, not Paris." """
 
-_NO_EVIDENCE_TEMPLATE = """Claim: "{claim}"
+_CRITIQUE_TEMPLATE = """CLAIM: "{claim}"
 
-Verification result: NO_EVIDENCE — no supporting information was found in the knowledge base.
+EVIDENCE (source: {source}):
+"{evidence}"
 
-Write a correction instruction noting that this claim could not be verified and should
-either be removed, qualified with uncertainty language, or supported with a citation."""
+Write the correction instruction:"""
 
 
 @dataclass
 class ClaimCritique:
-    """Critique for one unsupported claim."""
     claim: str
     label: NLILabel
     confidence: float
-    instruction: str        # the actionable correction instruction
+    instruction: str
     evidence_text: str | None
     evidence_source: str | None
+    used_llm: bool = False
 
 
 @dataclass
 class CritiqueResult:
-    """All critiques for one response, ready to pass to the corrector."""
     critiques: list[ClaimCritique]
     unsupported_count: int
     total_claims: int
 
     def to_correction_block(self) -> str:
-        """
-        Format critiques into a structured block for the correction prompt.
-
-        Each critique is numbered and labelled so the LLM can
-        address them systematically.
-        """
         if not self.critiques:
             return "No corrections required."
-
-        lines = [
-            f"The following {len(self.critiques)} claim(s) require correction:\n"
-        ]
+        lines = []
         for i, c in enumerate(self.critiques, 1):
             lines.append(
-                f"[{i}] Original claim: \"{c.claim}\"\n"
-                f"    Issue: {c.label.value.upper()}\n"
-                f"    Instruction: {c.instruction}\n"
+                f"{i}. Find this exact text in the original: \"{c.claim}\"\n"
+                f"   Correction: {c.instruction}"
             )
-        return "\n".join(lines)
+        return "\n\n".join(lines)
 
 
 class CritiqueGenerator:
-    """
-    Generates targeted, evidence-grounded critiques for unsupported claims.
-
-    Only processes claims labelled CONTRADICTION, NEUTRAL, or UNCERTAIN.
-    ENTAILMENT and NO_EVIDENCE claims are handled differently:
-    - ENTAILMENT: no critique needed
-    - NO_EVIDENCE: uses a template-only critique (no LLM call needed for these)
-    """
 
     def __init__(self, provider: BaseLLMProvider):
         self._provider = provider
 
     async def critique(self, report: HallucinationReport) -> CritiqueResult:
-        """
-        Generate critiques for all unsupported claims in the report.
-
-        Args:
-            report: HallucinationReport from the scorer.
-
-        Returns:
-            CritiqueResult with one ClaimCritique per unsupported claim.
-        """
         unsupported = report.unsupported_verifications
 
         if not unsupported:
@@ -126,9 +120,9 @@ class CritiqueGenerator:
 
         logger.info("Generating critiques for %d unsupported claims…", len(unsupported))
 
-        critiques: list[ClaimCritique] = []
-        for verification in unsupported:
-            critique = await self._critique_one(verification)
+        critiques = []
+        for v in unsupported:
+            critique = await self._critique_one(v)
             critiques.append(critique)
 
         return CritiqueResult(
@@ -138,36 +132,65 @@ class CritiqueGenerator:
         )
 
     async def _critique_one(self, v: ClaimVerification) -> ClaimCritique:
-        """Generate a critique for a single unsupported claim."""
+        """
+        Generate a critique using rule-based routing:
 
+        - NO_EVIDENCE or no evidence text → generic template
+        - NEUTRAL or UNCERTAIN → generic template (no strong signal)
+        - CONTRADICTION with low similarity (<0.75) → generic template
+          (evidence is topically related but about a different fact)
+        - CONTRADICTION with high similarity (>=0.75) → LLM call
+          (evidence is directly relevant to the specific claim)
+        """
+
+        # ── Case 1: No evidence at all ────────────────────────────────────────
+        if v.label == NLILabel.NO_EVIDENCE or not v.evidence_used:
+            return self._generic_critique(v, reason="no_evidence")
+
+        # ── Case 2: Neutral or uncertain — no strong signal ───────────────────
+        if v.label in (NLILabel.NEUTRAL, NLILabel.UNCERTAIN):
+            return self._generic_critique(v, reason="weak_signal")
+
+        # ── Case 3: Contradiction but low similarity ───────────────────────────
+        # Evidence chunk is about the same topic but different aspect.
+        # E.g. "Edinburgh degree" chunk contradicting "born in Edinburgh" claim.
+        # Trust the similarity score — if it's below threshold, the evidence
+        # is not directly addressing the specific fact in the claim.
+        if v.evidence_similarity < HIGH_SIMILARITY_THRESHOLD:
+            logger.debug(
+                "Low similarity (%.3f) for contradiction — using generic critique: %.60s",
+                v.evidence_similarity, v.claim,
+            )
+            return self._generic_critique(v, reason="low_similarity_contradiction")
+
+        # ── Case 4: Contradiction with high similarity — LLM call ─────────────
+        return await self._llm_critique(v)
+
+    def _generic_critique(self, v: ClaimVerification, reason: str) -> ClaimCritique:
+        """
+        Safe generic instruction that never fabricates a correction.
+        Used whenever evidence quality is insufficient for a specific fix.
+        """
         if v.label == NLILabel.NO_EVIDENCE:
-            # No LLM call needed — template is sufficient
             instruction = (
-                f"The claim \"{v.claim}\" could not be verified against any "
-                "available evidence. Consider removing it, qualifying it with "
-                "uncertainty language (e.g., 'reportedly', 'allegedly'), "
-                "or adding a citation."
+                "This claim could not be verified against the knowledge base. "
+                "Consider qualifying it with 'reportedly' or 'according to some sources'."
+            )
+        elif v.label == NLILabel.CONTRADICTION and reason == "low_similarity_contradiction":
+            instruction = (
+                "This claim appears to conflict with available evidence, but the "
+                "specific correction cannot be determined reliably. Consider "
+                "verifying this fact independently or qualifying it with 'reportedly'."
             )
         else:
-            prompt = _CRITIQUE_TEMPLATE.format(
-                claim=v.claim,
-                label=v.label.value,
-                confidence=v.confidence,
-                source=v.evidence_title or "Unknown source",
-                evidence=v.evidence_used or "No evidence text available",
+            instruction = (
+                "This claim could not be verified from available evidence. "
+                "Consider qualifying it with 'reportedly' or 'according to some sources'."
             )
-            response = await self._provider.generate(
-                prompt=prompt,
-                system_prompt=_SYSTEM_PROMPT,
-                temperature=0.1,
-                max_tokens=200,
-            )
-            instruction = response.text.strip()
 
         logger.debug(
-            "Critique for claim [%s]: %.100s…", v.label.value, instruction
+            "Generic critique [%s, reason=%s]: %.60s", v.label.value, reason, v.claim
         )
-
         return ClaimCritique(
             claim=v.claim,
             label=v.label,
@@ -175,4 +198,57 @@ class CritiqueGenerator:
             instruction=instruction,
             evidence_text=v.evidence_used,
             evidence_source=v.evidence_title,
+            used_llm=False,
         )
+
+    async def _llm_critique(self, v: ClaimVerification) -> ClaimCritique:
+        """
+        LLM-based critique for high-confidence contradictions with
+        high-similarity evidence. This is the only path that calls the LLM.
+        """
+        prompt = _CRITIQUE_TEMPLATE.format(
+            claim=v.claim,
+            source=v.evidence_title or "Knowledge base",
+            evidence=v.evidence_used,
+        )
+        response = await self._provider.generate(
+            prompt=prompt,
+            system_prompt=_SYSTEM_PROMPT,
+            temperature=0.0,
+            max_tokens=120,
+        )
+        instruction = response.text.strip()
+
+        # Safety net: if instruction is too long or looks like evidence copy,
+        # fall back to generic
+        if len(instruction) > 250 or _is_evidence_copy(instruction, v.evidence_used):
+            logger.warning(
+                "LLM critique looks like evidence copy for: %.60s — using generic",
+                v.claim,
+            )
+            return self._generic_critique(v, reason="llm_copy_detected")
+
+        logger.debug("LLM critique [similarity=%.3f]: %.120s", v.evidence_similarity, instruction)
+        return ClaimCritique(
+            claim=v.claim,
+            label=v.label,
+            confidence=v.confidence,
+            instruction=instruction,
+            evidence_text=v.evidence_used,
+            evidence_source=v.evidence_title,
+            used_llm=True,
+        )
+
+
+def _is_evidence_copy(instruction: str, evidence: str) -> bool:
+    """Detect verbatim copying of evidence into the instruction."""
+    if not evidence or len(instruction) < 20:
+        return False
+    evidence_words = evidence.split()
+    if len(evidence_words) < 8:
+        return False
+    for i in range(len(evidence_words) - 7):
+        window = " ".join(evidence_words[i:i + 8]).lower()
+        if window in instruction.lower():
+            return True
+    return False
