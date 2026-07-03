@@ -64,11 +64,13 @@ Final Response + Full Report
 ```bash
 git clone <repo-url>
 cd veritas
+
 python -m venv .venv
 .venv\Scripts\activate    # Windows
 # source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
-cp .env.example .env
+
+cp env.example .env
 ```
 
 ### One-time setup

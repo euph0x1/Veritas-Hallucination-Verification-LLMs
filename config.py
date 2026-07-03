@@ -35,13 +35,46 @@ class Settings(BaseSettings):
         Path("data/index/metadata.json"),
         description="Path to chunk metadata (text, source, etc.)"
     )
-    retrieval_top_k: int = Field(5, description="Number of evidence chunks to retrieve per claim")
+    retrieval_top_k: int = Field(
+        10,
+        description=(
+            "Number of chunks FAISS retrieves per claim. "
+            "Set to 10 when reranking is enabled so the reranker "
+            "has enough candidates to select from."
+        )
+    )
     retrieval_min_similarity: float = Field(
         0.55,
         description=(
             "Minimum cosine similarity to include a chunk as evidence. "
             "0.55 filters out loosely-related corpus chunks that would produce "
             "misleading NLI labels. Lower only if corpus coverage is poor."
+        )
+    )
+
+    # ── Reranker ──────────────────────────────────────────────────────────────
+    enable_reranking: bool = Field(
+        True,
+        description=(
+            "Enable cross-encoder reranking of FAISS results before NLI. "
+            "Reranking scores (claim, evidence) pairs jointly for much higher "
+            "relevance precision than bi-encoder retrieval alone."
+        )
+    )
+    reranker_model: str = Field(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description=(
+            "Cross-encoder model for reranking. "
+            "ms-marco-MiniLM-L-6-v2 is fast and accurate. "
+            "Upgrade to ms-marco-MiniLM-L-12-v2 for higher accuracy."
+        )
+    )
+    rerank_top_k: int = Field(
+        3,
+        description=(
+            "Number of chunks passed to NLI after reranking. "
+            "Top-3 gives the verifier focused, high-quality evidence "
+            "without overwhelming it with marginal chunks."
         )
     )
 
@@ -57,8 +90,11 @@ class Settings(BaseSettings):
     nli_batch_size: int = Field(8, description="Pairs per NLI forward pass")
 
     # ── Corpus ────────────────────────────────────────────────────────────────
-    corpus_chunk_size: int = Field(100, description="Chunk size in words — smaller = more precise NLI evidence")
-    corpus_chunk_overlap: int = Field(50, description="Overlap between consecutive chunks")
+    corpus_chunk_size: int = Field(
+        100,
+        description="Chunk size in words — smaller = more precise NLI evidence"
+    )
+    corpus_chunk_overlap: int = Field(20, description="Overlap between consecutive chunks")
     corpus_max_articles: int = Field(500, description="Wikipedia articles to index in V1")
 
     # ── Self-correction loop ──────────────────────────────────────────────────
