@@ -13,7 +13,6 @@ torch==2.5.1                      # NLI inference backend
 # ── Vector search ─────────────────────────────────────────────────────────────
 faiss-cpu==1.9.0                  # FAISS index (swap for faiss-gpu if GPU available)
 
-
 # ── Corpus / data ─────────────────────────────────────────────────────────────
 datasets==3.2.0                   # HuggingFace Wikipedia dataset loader
 tqdm==4.67.1                      # progress bars during indexing
