@@ -11,7 +11,6 @@ This guide contains the full testing instructions for Veritas, including endpoin
 ```bash
 ollama pull gemma3
 ```
-
 4. Build the FAISS corpus index once:
 
 ```bash
