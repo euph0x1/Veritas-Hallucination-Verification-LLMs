@@ -11,7 +11,6 @@ import pytest
 import numpy as np
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
 from core.providers.base import LLMResponse, EmbeddingResponse
 from core.pipeline.extractor import ClaimExtractor
 from core.pipeline.scorer import HallucinationScorer
