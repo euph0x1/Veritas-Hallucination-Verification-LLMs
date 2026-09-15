@@ -17,7 +17,7 @@ from core.pipeline.scorer import HallucinationScorer
 from core.pipeline.verifier import VerifierResult, ClaimVerification, NLILabel
 from core.pipeline.critic import CritiqueGenerator
 from core.pipeline.corrector import SelfCorrectionEngine
-from  core.pipeline.scorer import HallucinationReport
+from core.pipeline.scorer import HallucinationReport
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
