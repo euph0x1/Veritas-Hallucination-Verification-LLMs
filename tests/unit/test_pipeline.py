@@ -19,7 +19,6 @@ from core.pipeline.critic import CritiqueGenerator
 from core.pipeline.corrector import SelfCorrectionEngine
 from core.pipeline.scorer import HallucinationReport
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 def make_llm_provider(response_text: str = '["Claim one.", "Claim two."]'):
