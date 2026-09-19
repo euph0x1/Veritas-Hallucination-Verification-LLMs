@@ -113,6 +113,7 @@ class Settings(BaseSettings):
     api_port: int = Field(8000)
     api_debug: bool = Field(False)
 
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 # Module-level singleton — import this everywhere
