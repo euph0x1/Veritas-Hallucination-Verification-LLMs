@@ -117,3 +117,4 @@ class Settings(BaseSettings):
 
 # Module-level singleton — import this everywhere
 settings = Settings()
+
