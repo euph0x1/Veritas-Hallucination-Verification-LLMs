@@ -187,6 +187,7 @@ veritas/
 
 ---
 
+
 ## V2 Extensions (Future Work)
 
 - PostgreSQL / MLflow experiment tracking
